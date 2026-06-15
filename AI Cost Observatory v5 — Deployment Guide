@@ -1,0 +1,455 @@
+# AI Cost Observatory v5 — Deployment Guide
+
+An Azure Workbook providing **billed costs**, **consumed tokens**, **request diagnostics**, and a **forecast simulator** in one place — all without requiring App Insights or APIM.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────┐
+│  Azure Cost Mgmt API    │──┐
+│  or Metrics API         │  │
+└─────────────────────────┘  │
+                             ▼
+                  ┌──────────────────────┐
+                  │  ingest-cost-data.ps1 │  ← pulls data from APIs
+                  └──────────┬───────────┘
+                             │ POST JSON
+                             ▼
+                  ┌──────────────────────┐
+                  │  DCE (public HTTPS)   │  ← receives ingestion calls
+                  └──────────┬───────────┘
+                             │
+                             ▼
+                  ┌──────────────────────┐
+                  │  DCR (schema + route) │  ← validates & routes to table
+                  └──────────┬───────────┘
+                             │
+                             ▼
+┌────────────────────────────────────────────────────────┐
+│  Log Analytics Workspace                                │
+│                                                         │
+│  ┌────────────────┐  ┌────────────────┐  ┌───────────┐│
+│  │ AICostData_CL  │  │AzureDiagnostics│  │AzureMetrics││
+│  │ (custom table) │  │ (diag logs)    │  │ (platform) ││
+│  └────────────────┘  └────────────────┘  └───────────┘│
+└────────────────────────────┬───────────────────────────┘
+                             │ KQL queries
+                             ▼
+                  ┌──────────────────────┐
+                  │  Azure Workbook (v5)  │  ← visualization layer
+                  └──────────────────────┘
+```
+
+---
+
+## Step-by-Step Deployment
+
+### Step 1: Enable Diagnostic Settings on Foundry Account
+
+Portal → Foundry Account → Diagnostic settings → Add diagnostic setting:
+
+| Setting | Value |
+|---|---|
+| Logs | AllLogs |
+| Metrics | AllMetrics |
+| Destination | Send to Log Analytics workspace |
+
+This populates `AzureDiagnostics` (request logs, latency, errors) and `AzureMetrics` (token counts, requests) in your LAW.
+
+---
+
+### Step 2: Enable Diagnostic Settings on Project Level
+
+> ⚠️ **Easy to miss!** Account-level diagnostic settings do NOT cascade to projects. Each Foundry Project is a separate child resource with its own diagnostics.
+
+Portal → Foundry Account → Projects → *your project* → Diagnostic settings → Add:
+- Same config as Step 1 (AllLogs, AllMetrics → same LAW)
+
+Without this, project-level request logs and metrics won't appear in `AzureDiagnostics` / `AzureMetrics`.
+
+---
+
+### Step 3: Deploy the Ingestion Pipeline (DCE, DCR, Custom Table)
+
+```powershell
+az deployment group create `
+  --resource-group <your-rg> `
+  --template-file infra/ai-costs-workbook/cost-ingestion.bicep `
+  --parameters location=<region> logAnalyticsWorkspaceName=<your-law-name> `
+  --name cost-ingestion `
+  --query "properties.outputs" -o json
+```
+
+**This creates:**
+
+| Resource | What It Does |
+|---|---|
+| **DCE** (Data Collection Endpoint) | Public HTTPS endpoint that receives JSON POST requests |
+| **DCR** (Data Collection Rule) | Validates schema (11 columns) and routes data to the table |
+| **`AICostData_CL`** | Custom table in LAW storing cost/token records |
+
+**Save the outputs** — you need them for Step 5:
+```json
+{
+  "dceEndpoint": { "value": "https://dce-costdata-<hash>.<region>.ingest.monitor.azure.com" },
+  "dcrImmutableId": { "value": "dcr-<guid>" }
+}
+```
+
+---
+
+### Step 4: Create Service Principal and Assign RBAC
+
+The ingestion script needs a Service Principal (SP) to authenticate — user-based `az login` may be blocked by Conditional Access policies in enterprise tenants.
+
+#### 4a. Create the App Registration
+
+1. Portal → **Microsoft Entra ID** → **App registrations** → **New registration**
+2. Name: `CostIngestion-SP`
+3. Supported account types: **Single tenant**
+4. Redirect URI: Leave blank
+5. Click **Register**
+6. Copy the **Application (client) ID** and **Directory (tenant) ID**
+
+#### 4b. Create a Client Secret
+
+1. In the app registration → **Certificates & secrets** → **Client secrets** → **New client secret**
+2. Description: `ingestion-key`, Expiry: 12 months
+3. Click **Add** → **Copy the Value immediately** (won't be shown again)
+
+#### 4c. Assign Monitoring Metrics Publisher (on DCR)
+
+1. Portal → **Data Collection Rules** → select your DCR
+2. **Access control (IAM)** → **Add** → **Add role assignment**
+3. Role: `Monitoring Metrics Publisher` → **Next**
+4. Assign to: **User, group, or service principal** → Select members → search `CostIngestion-SP` → **Select** → **Review + assign**
+
+#### 4d. Assign Cost Management Reader (on Subscription)
+
+1. Portal → **Subscriptions** → select your subscription
+2. **Access control (IAM)** → **Add** → **Add role assignment**
+3. Role: `Cost Management Reader` → Select `CostIngestion-SP` → **Review + assign**
+
+#### 4e. Assign Reader (on Subscription)
+
+1. Same subscription → **Access control (IAM)** → **Add** → **Add role assignment**
+2. Role: `Reader` → Select `CostIngestion-SP` → **Review + assign**
+
+**Summary of SP roles:**
+
+| Role | Scope | Purpose |
+|---|---|---|
+| Monitoring Metrics Publisher | DCR | POST data to DCE ingestion endpoint |
+| Cost Management Reader | Subscription | Query Cost Management API |
+| Reader | Subscription | List Foundry accounts and projects |
+
+---
+
+### Step 5: Run the Ingestion Script
+
+```powershell
+# Login as Service Principal
+az login --service-principal `
+  --username "<Application-client-ID>" `
+  --password "<Client-secret-Value>" `
+  --tenant "<Directory-tenant-ID>"
+
+# Run ingestion
+./scripts/ingest-cost-data.ps1 `
+  -SubscriptionId "<your-subscription-id>" `
+  -DceEndpoint "<dce-endpoint-from-step-3>" `
+  -DcrImmutableId "<dcr-immutable-id-from-step-3>"
+```
+
+**Parameters:**
+
+| Parameter | Required | Default | Description |
+|---|---|---|---|
+| `SubscriptionId` | No | hardcoded | Azure subscription to query for AI costs |
+| `DceEndpoint` | **Yes** | — | DCE URI from Step 3 output |
+| `DcrImmutableId` | **Yes** | — | DCR immutable ID from Step 3 output |
+| `Source` | No | `CostManagement` | `CostManagement` (billed costs) or `Metrics` (token counts) |
+| `Timeframe` | No | `MonthToDate` | Time window for data pull |
+
+**What the script does:**
+1. Queries Azure Cost Management API (or Metrics API) for AI spend data
+2. Resolves Foundry Account → Project mapping via ARM API
+3. Transforms into 11-column records
+4. POSTs JSON to DCE → DCR routes to `AICostData_CL`
+
+---
+
+### Step 6: Verify Data in LAW
+
+Wait 2-5 minutes for ingestion lag, then run in Log Analytics:
+
+```kql
+AICostData_CL
+| summarize Records=count(), TotalCost=sum(BilledCost) by FoundryResource, Project, Model
+| order by TotalCost desc
+```
+
+Expected output: rows showing your Foundry accounts, projects, models, and costs.
+
+Also verify diagnostic data is flowing:
+```kql
+AzureDiagnostics
+| where ResourceProvider == "MICROSOFT.COGNITIVESERVICES"
+| summarize count() by OperationName
+| take 10
+```
+
+---
+
+### Step 7: Deploy the Workbook
+
+**Option A — Portal (recommended for first time):**
+1. Portal → **Monitor** → **Workbooks**
+2. Find the existing workbook and open it, or click **New**
+3. Click the **Advanced Editor** icon (`</>` in the toolbar)
+4. Select all existing content and **replace** with the contents of `ai-cost-dashboard-v5.json`
+5. Click **Apply**
+6. Click **Save** (💾) → confirm the resource group and location
+
+**Option B — CLI:**
+```powershell
+az deployment group create `
+  --resource-group <your-rg> `
+  --template-file infra/ai-costs-workbook/workbook.bicep `
+  --parameters location=<region> `
+    appInsightsId="/subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.Insights/components/<app-insights-name>" `
+    envSuffix=<any-unique-string> `
+  --query "properties.provisioningState" -o tsv
+```
+
+> `envSuffix` is only used to generate a unique workbook resource name — it has nothing to do with the LAW.
+
+---
+
+### Step 8: Run Ingestion to Refresh Data
+
+```powershell
+# Login as Service Principal
+az login --service-principal `
+  --username "<Application-client-ID>" `
+  --password "<Client-secret-Value>" `
+  --tenant "<Directory-tenant-ID>"
+
+# Run ingestion
+powershell -ExecutionPolicy Bypass -File .\scripts\ingest-cost-data.ps1 `
+  -SubscriptionId "<your-subscription-id>" `
+  -DceEndpoint "<your-dce-endpoint>" `
+  -DcrImmutableId "<your-dcr-immutable-id>"
+```
+
+**Look up DCE/DCR values if needed:**
+```powershell
+az monitor data-collection endpoint list -g <your-rg> `
+  --query "[?contains(name,'costdata')].logsIngestion.endpoint" -o tsv
+
+az monitor data-collection rule list -g <your-rg> `
+  --query "[?contains(name,'costdata')].immutableId" -o tsv
+```
+
+Wait 2-5 minutes for ingestion lag, then refresh the workbook in the portal.
+
+---
+
+## Data Sources Explained
+
+| Table | Populated By | Contains |
+|---|---|---|
+| `AICostData_CL` | Ingestion script (Step 5) | Billed cost, tokens, model, project, direction per day |
+| `AzureDiagnostics` | Diagnostic settings (Steps 1-2) | Per-request logs: latency, status, operation, errors |
+| `AzureMetrics` | Diagnostic settings (Steps 1-2) | Platform metrics: TokenTransaction, ProcessedPromptTokens, AzureOpenAIRequests |
+
+> **Project mapping note:** The Cost Management API does NOT return project-level data directly. The `Project` field in `AICostData_CL` is derived by the ingestion script via an ARM API call to list projects under each account. Single-project accounts get direct attribution; multi-project accounts are labelled as "(shared)".
+
+---
+
+## Workbook Sections
+
+---
+
+### 1. Overview KPIs
+**Value:** Single-glance health check. Answers "how much are we spending, how fast, and how efficiently?"
+
+| Metric | What It Tells You |
+|---|---|
+| Total Billed Cost ($) | Cumulative spend across all models and accounts |
+| Daily Avg Cost ($) | Burn rate — is spending steady or spiking? |
+| Projected Monthly ($) | Budget planning — will we blow the budget? |
+| Total Tokens (K) | Consumption volume — are we using more than expected? |
+| Requests | Interaction count from diagnostic logs |
+| Avg Tokens/Req | Efficiency — are prompts/responses bloated? |
+| Models | How many distinct models are incurring cost |
+
+---
+
+### 2. Cost per Model
+
+#### Cost by Model Table
+**Value:** Identifies the most expensive models and whether cost is driven by input (prompts) or output (completions). Answers "which model is eating my budget and why?"
+
+Shows input/output/total cost per model with percentage split and pricing unit.
+
+#### Cost Share Pie Chart
+**Value:** Instant visual of cost concentration. Answers "is one model dominating spend?" — a single model >80% means vendor lock-in risk or optimization opportunity.
+
+---
+
+### 3. Token Usage per Model
+
+#### Tokens by Model Table
+**Value:** Reveals token economics. Token unit costs. The Input % column shows prompt-heaviness — high input % with low output may mean retrieval prompts are too long.
+
+#### Input vs Output Bar Chart
+**Value:** Visual comparison of token direction per model. Answers "are my prompts too verbose relative to completions?" — unbalanced ratios suggest prompt engineering improvements.
+
+---
+
+### 4. Foundry Account → Project Drill-Down
+
+#### Foundry Account Summary (Clickable Grid)
+**Value:** The command center for multi-account visibility. Answers "how is cost distributed across my Foundry accounts?" All 3 accounts appear with totals. **Click a row** to drill into that account's projects.
+
+| Column | Purpose |
+|---|---|
+| Foundry Account | Account name (Costrelatedusecases, fondryprojects, foudry-orga) |
+| Total Cost ($) | Aggregate spend for the account |
+| Tokens (K) | Total consumed tokens |
+| Models Used | Distinct model count |
+| Projects | Number of projects within the account |
+
+#### Cost Share Pie (by Account)
+**Value:** Proportional view across accounts. Answers "which account is the biggest spender?" — useful for chargeback and team-level budgeting.
+
+#### Projects Table (Conditional — appears on row click)
+**Value:** Per-project breakdown within the selected account. Answers "which project inside this account is driving cost?" Shows cost, tokens, input/output split, and model count per project.
+
+#### Cost by Project & Model (Bar Chart)
+**Value:** Stacked model cost per project. Answers "within this account, which project-model combinations are most expensive?" — pinpoints the exact workload to optimize.
+
+#### Tokens (K) by Project & Model (Bar Chart)
+**Value:** Token consumption per project split by model. Answers "is one project consuming disproportionate tokens?" — helps identify inefficient prompt patterns in specific workloads.
+
+#### Model Breakdown per Project (Table)
+**Value:** The most granular view — project × model cost and tokens. Answers "if I switch this project's model, how much would I save?" — supports model migration decisions.
+
+---
+
+### 5. Interaction Analytics
+
+#### Interaction Profile Table
+**Value:** The operational baseline. Answers "what does a typical interaction look like?" — avg tokens/req feeds capacity planning, cost/req drives unit economics, and P95 latency sets SLA expectations.
+
+#### Interaction Profile per Model (Table)
+**Value:** Per-model breakdown showing each model's interactions, avg tokens/req, prompt/completion split, input ratio, daily request rate, latency, and total cost. Answers "how does gpt-4o behave differently than gpt-4.1?" — the Input Ratio column directly feeds the forecast simulator.
+
+#### Interactions Over Time (Time Chart)
+**Value:** Traffic pattern visualization. Answers "when do users hit the system?" — identifies peak hours for autoscaling decisions and off-peak windows for batch processing.
+
+#### Latency Distribution (Pie Chart)
+**Value:** SLA compliance at a glance. Answers "what % of requests meet our latency target?" — if >10% are in the 3-10s bucket, users are experiencing degraded UX.
+
+#### Request Reliability Table
+**Value:** Operational health per operation. Answers "are we getting throttled? Are there errors?" — 429s mean quota issues, non-200/429 errors mean bugs or service degradation.
+
+#### Latency Over Time (Avg vs P95)
+**Value:** Latency trend analysis. Answers "is latency getting worse?" — a widening gap between avg and P95 means tail latency issues, possibly from large prompts or model congestion.
+
+---
+
+### 6. Interactions by Project
+
+#### Interactions by Project Table
+**Value:** Per-project operational metrics. Answers "which project has reliability problems?" — surfaces per-project throttle rates and error counts so you know where to add retry logic or request quota increases.
+
+#### Interactions Over Time by Project (Time Chart)
+**Value:** Traffic split by project. Answers "which project drives peak load?" — for capacity planning and cost attribution.
+
+#### Request Share by Project (Pie Chart)
+**Value:** Proportional request volume. Answers "which project is the heaviest user of the API?" — useful for chargeback and quota allocation decisions.
+
+---
+
+### 7. Native Metrics by Project
+
+#### Tokens by Project Table (AzureMetrics)
+**Value:** Platform-reported token counts (not billing-derived). Answers "do the tokens reported by Azure metrics match what we're billed for?" — discrepancies reveal ingestion gaps or metering anomalies. Breaks down by ProcessedPromptTokens, GeneratedTokens, and TokenTransaction.
+
+#### Token Trend by Project (Time Chart)
+**Value:** Real-time token consumption from platform metrics. Answers "is a project's token usage trending up right now?" — faster signal than cost data (which has billing lag).
+
+#### Requests by Project Table (AzureMetrics)
+**Value:** Platform-counted requests per project. Answers "how many API calls is each project making?" — cross-reference with diagnostic logs to validate completeness.
+
+#### Request Trend by Project (Time Chart)
+**Value:** Request volume over time from platform metrics. Answers "is request volume growing?" — early warning for scaling needs before cost spikes appear.
+
+---
+
+### 8. Cost & Token Trends
+
+#### Granularity Switcher (Daily/Monthly)
+**Value:** Toggle between daily granularity (spot anomalies, day-level spikes) and monthly aggregation (executive reporting, budget tracking). The default is Monthly. Controls all charts and tables in this section.
+
+#### Cost Trend by Model (Bar Chart)
+**Value:** Stacked cost trend by model. Answers "did something change yesterday?" (Daily) or "how is spend evolving month-over-month?" (Monthly).
+
+#### Token Trend by Model (Bar Chart)
+**Value:** Stacked token consumption trend by model. Answers "is token usage growing, stable, or seasonal?" — consolidates the former daily token chart from Section 3.
+
+#### Cost by Model Table
+**Value:** Period-level cost journal per model. Reveals seasonal patterns, new model adoption, and retirement candidates.
+
+#### Cost Growth Table (Period-over-Period %)
+**Value:** Growth rate tracking. A positive growth % three periods running means budget escalation; negative growth after optimization confirms ROI.
+
+---
+
+### 9. Cost Forecast Simulator
+
+#### Model Selector (Pills)
+**Value:** Pick which model to forecast for. The input/output token ratio and avg tokens/interaction are computed from that model's actual historical data, not an aggregate.
+
+#### Selected Model Baseline
+**Value:** Shows the selected model's specific metrics: total interactions, avg tokens/interaction, prompt/completion breakdown, input ratio, and daily interaction rate. This is the data feeding the projections below.
+
+#### Scenario Parameters
+**Value:** Configurable user counts and interactions-per-user for Light/Medium/Heavy scenarios. Adjust to model your expected growth.
+
+#### Scenario Cost Projection Table
+**Value:** The money table. Combines model-specific avg tokens and input ratio with published pricing to project monthly and annual costs per scenario. Answers "if we grow to 15K heavy users on gpt-4o, what's the annual bill?"
+
+#### Monthly Cost by Scenario (Bar Chart)
+**Value:** Visual comparison of cost across scenarios. Instantly shows the cost delta between growth levels.
+
+#### Monthly Token Volume by Scenario (Bar Chart)
+**Value:** Token consumption projection. Answers "how many millions of tokens will each scenario consume?" — useful for quota planning.
+
+---
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `ai-cost-dashboard-v5.json` | Workbook serialized JSON (paste into Advanced Editor) |
+| `workbook.bicep` | Deploys all workbook versions (v1-v5) via Bicep |
+| `cost-ingestion.bicep` | Creates DCE, DCR, and `AICostData_CL` custom table |
+| `../scripts/ingest-cost-data.ps1` | Pulls cost/metrics data from APIs and ingests to LAW |
+| `README-v5.md` | This file |
+
+## Changelog
+
+| Date | Change |
+|---|---|
+| 2026-05-28 | **Section 8 — Cost & Token Trends:** Added month-over-month cost and token usage trends with Daily/Monthly granularity switcher; includes growth % table split by model to track spend acceleration |
+| 2026-05-28 | **Section 5 — Interaction Profile per Model:** Added per-model breakdown showing avg tokens/interaction, input/output ratio, daily rate, latency, and cost per model |
+| 2026-05-28 | **Section 9 — Forecast Simulator:** Model selector now dynamically pulls all models from data; forecaster auto-computes actual input ratio and tokens/interaction from the selected model's historical baseline (no manual assumptions) |
+| 2026-05-28 | **Section 9 — Pricing coverage:** Expanded pricing table to 10 models (gpt-4.1, gpt-4.1-mini, gpt-4.1-nano, gpt-4o, gpt-4o-mini, o3, o3-mini, o4-mini, embedding models) with fallback for unknown models |
+| 2026-05-28 | **Bug fixes:** Fixed x-axis "055 2026" → "May 2026" (KQL MMM not supported); fixed forecast datatable parse error (expressions not allowed in datatable literals) |
+| 2026-05-19 | Rewrote as deployment guide with step-by-step instructions |
+| 2026-05-19 | Initial v5 — Foundry Account → Project drill-down |
