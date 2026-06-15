@@ -11,4 +11,4 @@ Important context: This is a work in progress. We've been iterating based on fee
 What views/metrics matter most to you?
 How do you want to group data? (by team, project, model, user?)
 What questions do you need this dashboard to answer for leadership?
-Your input directly shapes what we build next. Happy to walk through it together if that's easier.
+Your input directly shapes what we build next. 
