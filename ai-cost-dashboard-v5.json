@@ -1,0 +1,1366 @@
+{
+    "version": "Notebook/1.0",
+    "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json",
+    "items": [
+        {
+            "type": 1,
+            "content": {
+                "json": "# AI Cost Observatory v5 â€” Unified Cost & Usage Analytics\n---\n> **No APIM or App Insights required.** All data sourced from Log Analytics:\n> - `AICostData_CL` â€” actual billed costs from Azure Cost Management (run `ingest-cost-data.ps1` to refresh)\n> - `AzureDiagnostics` â€” per-request logs from Cognitive Services diagnostic settings\n> - Token counts from **actual consumed quantity** reported by Azure Cost Management (no price derivation needed)\n>\n> **Prerequisites:**\n> 1. [Diagnostic settings](https://learn.microsoft.com/azure/ai-services/diagnostic-logging) sending **RequestResponse** logs to your LAW\n> 2. Cost ingestion script run at least once: `./scripts/ingest-cost-data.ps1`"
+            },
+            "name": "header"
+        },
+        {
+            "type": 9,
+            "content": {
+                "version": "KqlParameterItem/1.0",
+                "parameters": [
+                    {
+                        "id": "v4-p-sub",
+                        "version": "KqlParameterItem/1.0",
+                        "name": "Subscription",
+                        "type": 6,
+                        "isRequired": true,
+                        "multiSelect": false,
+                        "typeSettings": {
+                            "additionalResourceOptions": [
+                                "value::1"
+                            ],
+                            "includeAll": false
+                        }
+                    },
+                    {
+                        "id": "v4-p-law",
+                        "version": "KqlParameterItem/1.0",
+                        "name": "LogAnalyticsWorkspace",
+                        "label": "Log Analytics Workspace",
+                        "type": 5,
+                        "isRequired": true,
+                        "query": "Resources\n| where type =~ 'microsoft.operationalinsights/workspaces'\n| project id, name, subscriptionId, resourceGroup",
+                        "crossComponentResources": [
+                            "{Subscription}"
+                        ],
+                        "typeSettings": {
+                            "additionalResourceOptions": [
+                                "value::1"
+                            ],
+                            "showDefault": false
+                        },
+                        "queryType": 1
+                    },
+                    {
+                        "id": "v4-p-time",
+                        "version": "KqlParameterItem/1.0",
+                        "name": "TimeRange",
+                        "type": 4,
+                        "isRequired": true,
+                        "typeSettings": {
+                            "selectableValues": [
+                                {
+                                    "durationMs": 86400000
+                                },
+                                {
+                                    "durationMs": 604800000
+                                },
+                                {
+                                    "durationMs": 2592000000
+                                },
+                                {
+                                    "durationMs": 5184000000
+                                },
+                                {
+                                    "durationMs": 7776000000
+                                }
+                            ]
+                        },
+                        "value": {
+                            "durationMs": 2592000000
+                        }
+                    }
+                ],
+                "style": "above"
+            },
+            "name": "parameters"
+        },
+        {
+            "type": 1,
+            "content": {
+                "json": "## Overview\n> **Value:** Single-glance health check answering “how much are we spending, how fast, and how efficiently?”\n>\n> Tracks total billed cost, daily burn rate, projected monthly spend, token volume, request count, and efficiency (avg tokens per request)."
+            },
+            "name": "section-overview"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL | where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end} | summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource, Project;\nlet totalCost = toscalar(CostData | summarize round(sum(BilledCost), 4));\nlet totalTokens = toscalar(CostData | summarize round(sum(ConsumedQuantity), 0));\nlet modelCount = toscalar(CostData | summarize dcount(Model));\nlet daySpan = toscalar(CostData | summarize max_of(datetime_diff('day', max(ChargePeriodStart), min(ChargePeriodStart)) + 1, 1));\nlet reqCount = toscalar(AzureDiagnostics\n| where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES' and Category == 'RequestResponse'\n| where OperationName in ('Completions_Create','create_completions','create_response')\n| summarize count());\nlet avgTokensPerReq = iff(reqCount > 0, round((totalTokens * 1.0) / (reqCount * 1.0), 0), 0.0);\nlet dailyCost = iff(daySpan > 0, round((totalCost * 1.0) / (daySpan * 1.0), 4), 0.0);\nlet projectedMonthlyCost = round(dailyCost * 30, 2);\nlet totalTokensK = round((totalTokens * 1.0) / 1000, 1);\nCostData\n| summarize TotalCost = round(sum(BilledCost), 4), Models = dcount(Model)\n| extend DailyCost = dailyCost, Projected = projectedMonthlyCost, TokensK = totalTokensK, Requests = reqCount, AvgTok = avgTokensPerReq\n| project\n    ['Total Billed Cost ($)'] = TotalCost,\n    ['Daily Avg Cost ($)'] = DailyCost,\n    ['Projected Monthly ($)'] = Projected,\n    ['Total Tokens (K)'] = TokensK,\n    ['Requests'] = Requests,\n    ['Avg Tokens/Req'] = AvgTok,\n    ['Models'] = Models",
+                "size": 4,
+                "title": "KPI Summary",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "table",
+                "gridSettings": {
+                    "formatters": [
+                        {
+                            "columnMatch": "Value",
+                            "formatter": 1,
+                            "formatOptions": {},
+                            "numberFormat": {}
+                        }
+                    ]
+                }
+            },
+            "name": "kpi-summary"
+        },
+        {
+            "type": 1,
+            "content": {
+                "json": "---\n## 💰 Cost per Model\n> **Value:** Identifies your most expensive models and whether cost is driven by input (prompts) or output (completions).\n>\n> Answers: “Which model is eating my budget?” “Should I optimize prompts or switch models?”\n>\n> Source: AICostData_CL — actual billed USD from Azure Cost Management"
+            },
+            "name": "section-cost-per-model"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL | where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end} | summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource, Project;\nCostData\n| summarize\n    InputCost = round(sumif(BilledCost, Direction == 'Input'), 6),\n    OutputCost = round(sumif(BilledCost, Direction == 'Output'), 6),\n    PricingUnit = take_any(UnitOfMeasure)\n  by Model\n| extend TotalCost = round(InputCost + OutputCost, 6)\n| extend InputPct = iff(TotalCost > 0, round(InputCost * 100 / TotalCost, 0), 0.0)\n| extend OutputPct = iff(TotalCost > 0, round(OutputCost * 100 / TotalCost, 0), 0.0)\n| project Model,\n    ['Input Cost ($)'] = InputCost,\n    ['Output Cost ($)'] = OutputCost,\n    ['Total Cost ($)'] = TotalCost,\n    ['Input %'] = InputPct,\n    ['Output %'] = OutputPct,\n    ['Pricing Unit'] = PricingUnit\n| order by ['Total Cost ($)'] desc",
+                "size": 4,
+                "title": "Cost Breakdown by Model",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "table",
+                "gridSettings": {
+                    "formatters": [
+                        {
+                            "columnMatch": "Cost \\(\\$\\)",
+                            "formatter": 3,
+                            "formatOptions": {},
+                            "numberFormat": {}
+                        },
+                        {
+                            "columnMatch": "%",
+                            "formatter": 1
+                        },
+                        {
+                            "columnMatch": "Pricing Unit",
+                            "formatter": 1
+                        }
+                    ]
+                }
+            },
+            "customWidth": "50",
+            "name": "cost-by-model-table"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL | where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end} | summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource, Project;\nCostData\n| summarize Cost = round(sum(BilledCost), 4) by Model\n| render piechart",
+                "size": 1,
+                "title": "Cost Share by Model",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "piechart"
+            },
+            "customWidth": "50",
+            "name": "cost-model-pie"
+        },
+        {
+            "type": 1,
+            "content": {
+                "json": "---\n## 🔢 Token Usage per Model\n> **Value:** Reveals token economics — are you paying more per token than published rates? Are prompts bloated relative to completions?\n>\n> Answers: “What is my effective cost per 1K tokens?” “Is my input ratio healthy?”\n>\n> Source: AICostData_CL — actual consumed quantity from Cost Management. UnitCost = effective price per billing unit."
+            },
+            "name": "section-tokens-per-model"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL | where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end} | summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource, Project;\nCostData\n| summarize\n    InputTokens = round(sumif(ConsumedQuantity, Direction == 'Input'), 0),\n    OutputTokens = round(sumif(ConsumedQuantity, Direction == 'Output'), 0),\n    InputCost = round(sumif(BilledCost, Direction == 'Input'), 6),\n    OutputCost = round(sumif(BilledCost, Direction == 'Output'), 6),\n    AvgUnitCost = round(avg(UnitCost), 6),\n    PricingUnit = take_any(UnitOfMeasure)\n  by Model\n| extend TotalTokens = InputTokens + OutputTokens\n| extend TotalCost = round(InputCost + OutputCost, 6)\n| extend InputRatio = iff(TotalTokens > 0, round(InputTokens * 100 / TotalTokens, 1), 0.0)\n| extend UnitMultiplier = case(\n    PricingUnit == '1M', 1000000.0,\n    PricingUnit == '1K', 1000.0,\n    PricingUnit == '10K', 10000.0,\n    1.0)\n| extend EffectiveRate = iff(TotalTokens > 0, round(TotalCost / TotalTokens * UnitMultiplier, 4), 0.0)\n| project Model,\n    ['Input Tokens'] = tolong(InputTokens),\n    ['Output Tokens'] = tolong(OutputTokens),\n    ['Total Tokens'] = tolong(TotalTokens),\n    ['Total Cost ($)'] = TotalCost,\n    ['Input %'] = InputRatio,\n    ['Effective $/Unit'] = EffectiveRate,\n    ['Pricing Unit'] = PricingUnit,\n    ['Avg Unit Cost'] = AvgUnitCost\n| order by ['Total Cost ($)'] desc",
+                "size": 4,
+                "title": "Token Usage by Model (Actual Consumed Quantity)",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "table",
+                "gridSettings": {
+                    "formatters": [
+                        {
+                            "columnMatch": "Tokens",
+                            "formatter": 3,
+                            "formatOptions": {},
+                            "numberFormat": {}
+                        },
+                        {
+                            "columnMatch": "Total Cost",
+                            "formatter": 3,
+                            "formatOptions": {},
+                            "numberFormat": {}
+                        },
+                        {
+                            "columnMatch": "Effective",
+                            "formatter": 1,
+                            "numberFormat": {}
+                        },
+                        {
+                            "columnMatch": "Pricing Unit",
+                            "formatter": 1
+                        }
+                    ]
+                }
+            },
+            "customWidth": "100",
+            "name": "tokens-by-model-table"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL | where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end} | summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource, Project;\nCostData\n| summarize Tokens = round(sum(ConsumedQuantity), 0) by Model, Direction\n| render barchart",
+                "size": 0,
+                "title": "Input vs Output Tokens by Model",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "barchart",
+                "chartSettings": {
+                    "xAxis": "Model",
+                    "yAxis": [
+                        "Tokens"
+                    ],
+                    "group": "Direction",
+                    "showLegend": true
+                }
+            },
+            "customWidth": "40",
+            "name": "tokens-io-bar"
+        },
+        {
+            "type": 1,
+            "content": {
+                "json": "---\n## 🏢 Foundry Account → Project Drill-Down\n> **Value:** Multi-account command center. See cost distribution across all Foundry accounts, then drill into any account to see per-project cost and token breakdown.\n>\n> Answers: “Which account is the biggest spender?” “Within that account, which project drives cost?”\n>\n> Click a row to drill down. Data source: AICostData_CL (Project mapped via ingestion script)."
+            },
+            "name": "section-foundry-drilldown"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL\n| where isnotempty(FoundryResource)\n| where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end}\n| summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource;\nCostData\n| summarize\n    TotalCost = round(sum(BilledCost), 4),\n    TotalTokens = round(sum(ConsumedQuantity), 0),\n    Models = dcount(Model),\n    Projects = dcount(Project)\n  by FoundryResource\n| extend TokensK = round((TotalTokens * 1.0) / 1000, 1)\n| project FoundryAccount = FoundryResource,\n    TotalCost,\n    TokensK,\n    Models,\n    Projects\n| order by TotalCost desc",
+                "size": 4,
+                "title": "Foundry Accounts — Click a row to drill down",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "table",
+                "gridSettings": {
+                    "formatters": [
+                        {
+                            "columnMatch": "TotalCost",
+                            "formatter": 3,
+                            "formatOptions": {},
+                            "numberFormat": {
+                                "unit": 0,
+                                "options": {
+                                    "style": "decimal",
+                                    "minimumFractionDigits": 4
+                                }
+                            }
+                        },
+                        {
+                            "columnMatch": "TokensK",
+                            "formatter": 3,
+                            "formatOptions": {}
+                        },
+                        {
+                            "columnMatch": "Models",
+                            "formatter": 1
+                        },
+                        {
+                            "columnMatch": "Projects",
+                            "formatter": 1
+                        }
+                    ],
+                    "labelSettings": [
+                        {
+                            "columnId": "FoundryAccount",
+                            "label": "Foundry Account"
+                        },
+                        {
+                            "columnId": "TotalCost",
+                            "label": "Total Cost ($)"
+                        },
+                        {
+                            "columnId": "TokensK",
+                            "label": "Tokens (K)"
+                        },
+                        {
+                            "columnId": "Models",
+                            "label": "Models Used"
+                        },
+                        {
+                            "columnId": "Projects",
+                            "label": "Projects"
+                        }
+                    ]
+                },
+                "exportedParameters": [
+                    {
+                        "fieldName": "FoundryAccount",
+                        "parameterName": "SelectedFoundryAccount",
+                        "parameterType": 1
+                    }
+                ]
+            },
+            "customWidth": "60",
+            "name": "foundry-account-summary"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL\n| where isnotempty(FoundryResource)\n| where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end}\n| summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource;\nCostData\n| summarize Cost = round(sum(BilledCost), 4) by FoundryResource\n| render piechart",
+                "size": 1,
+                "title": "Cost Share by Foundry Account",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "piechart"
+            },
+            "customWidth": "40",
+            "name": "cost-share-foundry-pie"
+        },
+        {
+            "type": 1,
+            "content": {
+                "json": "### 🔍 Projects in **{SelectedFoundryAccount}**\n> **Value:** Per-project breakdown within the selected account — pinpoints exactly which workload to optimize.\n>\n> Shows cost, tokens, input/output split, and model usage per project."
+            },
+            "conditionalVisibility": {
+                "parameterName": "SelectedFoundryAccount",
+                "comparison": "isNotEqualTo",
+                "value": ""
+            },
+            "name": "section-project-drilldown"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL\n| where isnotempty(FoundryResource)\n| where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end}\n| summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource;\nCostData\n| where FoundryResource == \"{SelectedFoundryAccount}\"\n| summarize\n    TotalCost = round(sum(BilledCost), 4),\n    TotalTokens = round(sum(ConsumedQuantity), 0),\n    InputTokens = round(sumif(ConsumedQuantity, Direction == \"Input\"), 0),\n    OutputTokens = round(sumif(ConsumedQuantity, Direction == \"Output\"), 0),\n    Models = dcount(Model)\n  by Project\n| extend TokensK = round((TotalTokens * 1.0) / 1000, 1)\n| extend InputPct = iff(TotalTokens > 0, round((InputTokens * 100.0) / (TotalTokens * 1.0), 1), 0.0)\n| project Project,\n    TotalCost,\n    TokensK,\n    InputTokens = tolong(InputTokens),\n    OutputTokens = tolong(OutputTokens),\n    InputPct,\n    Models\n| order by TotalCost desc",
+                "size": 4,
+                "title": "Projects in {SelectedFoundryAccount}",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "table",
+                "gridSettings": {
+                    "formatters": [
+                        {
+                            "columnMatch": "TotalCost",
+                            "formatter": 3,
+                            "formatOptions": {},
+                            "numberFormat": {
+                                "unit": 0,
+                                "options": {
+                                    "style": "decimal",
+                                    "minimumFractionDigits": 4
+                                }
+                            }
+                        },
+                        {
+                            "columnMatch": "TokensK",
+                            "formatter": 3,
+                            "formatOptions": {}
+                        },
+                        {
+                            "columnMatch": "InputTokens",
+                            "formatter": 1
+                        },
+                        {
+                            "columnMatch": "OutputTokens",
+                            "formatter": 1
+                        },
+                        {
+                            "columnMatch": "InputPct",
+                            "formatter": 3,
+                            "formatOptions": {}
+                        },
+                        {
+                            "columnMatch": "Models",
+                            "formatter": 1
+                        }
+                    ],
+                    "labelSettings": [
+                        {
+                            "columnId": "Project",
+                            "label": "Project"
+                        },
+                        {
+                            "columnId": "TotalCost",
+                            "label": "Total Cost ($)"
+                        },
+                        {
+                            "columnId": "TokensK",
+                            "label": "Tokens (K)"
+                        },
+                        {
+                            "columnId": "InputTokens",
+                            "label": "Input Tokens"
+                        },
+                        {
+                            "columnId": "OutputTokens",
+                            "label": "Output Tokens"
+                        },
+                        {
+                            "columnId": "InputPct",
+                            "label": "Input %"
+                        },
+                        {
+                            "columnId": "Models",
+                            "label": "Models Used"
+                        }
+                    ]
+                }
+            },
+            "conditionalVisibility": {
+                "parameterName": "SelectedFoundryAccount",
+                "comparison": "isNotEqualTo",
+                "value": ""
+            },
+            "name": "project-cost-table"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL\n| where isnotempty(FoundryResource)\n| where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end}\n| summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource;\nCostData\n| where FoundryResource == \"{SelectedFoundryAccount}\"\n| summarize Cost = round(sum(BilledCost), 4) by Project, Model\n| render barchart",
+                "size": 0,
+                "title": "Cost by Project & Model",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "barchart",
+                "chartSettings": {
+                    "xAxis": "Project",
+                    "yAxis": [
+                        "Cost"
+                    ],
+                    "group": "Model",
+                    "showLegend": true
+                }
+            },
+            "customWidth": "50",
+            "conditionalVisibility": {
+                "parameterName": "SelectedFoundryAccount",
+                "comparison": "isNotEqualTo",
+                "value": ""
+            },
+            "name": "project-cost-bar"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL\n| where isnotempty(FoundryResource)\n| where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end}\n| summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource;\nCostData\n| where FoundryResource == \"{SelectedFoundryAccount}\"\n| summarize Tokens = round(sum(ConsumedQuantity) / 1000, 1) by Project, Model\n| render barchart",
+                "size": 0,
+                "title": "Tokens (K) by Project & Model",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "barchart",
+                "chartSettings": {
+                    "xAxis": "Project",
+                    "yAxis": [
+                        "Tokens"
+                    ],
+                    "group": "Model",
+                    "showLegend": true
+                }
+            },
+            "customWidth": "50",
+            "conditionalVisibility": {
+                "parameterName": "SelectedFoundryAccount",
+                "comparison": "isNotEqualTo",
+                "value": ""
+            },
+            "name": "project-tokens-bar"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL\n| where isnotempty(FoundryResource)\n| where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end}\n| summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource;\nCostData\n| where FoundryResource == \"{SelectedFoundryAccount}\"\n| summarize\n    TotalCost = round(sum(BilledCost), 4),\n    TotalTokens = round(sum(ConsumedQuantity), 0)\n  by Project, Model\n| extend TokensK = round((TotalTokens * 1.0) / 1000, 1)\n| project Project, Model, TotalCost, TokensK\n| order by Project asc, TotalCost desc",
+                "size": 4,
+                "title": "Model Breakdown per Project in {SelectedFoundryAccount}",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "table",
+                "gridSettings": {
+                    "formatters": [
+                        {
+                            "columnMatch": "TotalCost",
+                            "formatter": 3,
+                            "formatOptions": {},
+                            "numberFormat": {
+                                "unit": 0,
+                                "options": {
+                                    "style": "decimal",
+                                    "minimumFractionDigits": 4
+                                }
+                            }
+                        },
+                        {
+                            "columnMatch": "TokensK",
+                            "formatter": 3,
+                            "formatOptions": {}
+                        }
+                    ],
+                    "labelSettings": [
+                        {
+                            "columnId": "Project",
+                            "label": "Project"
+                        },
+                        {
+                            "columnId": "Model",
+                            "label": "Model"
+                        },
+                        {
+                            "columnId": "TotalCost",
+                            "label": "Cost ($)"
+                        },
+                        {
+                            "columnId": "TokensK",
+                            "label": "Tokens (K)"
+                        }
+                    ]
+                }
+            },
+            "conditionalVisibility": {
+                "parameterName": "SelectedFoundryAccount",
+                "comparison": "isNotEqualTo",
+                "value": ""
+            },
+            "name": "model-usage-per-project"
+        },
+        {
+            "type": 1,
+            "content": {
+                "json": "---\n## 📊 Interaction Analytics\n> **Value:** Operational baseline for capacity planning and SLA tracking. Shows what a typical interaction looks like (latency, cost, tokens) and where reliability problems exist.\n>\n> Answers: “Are we getting throttled?” “What is our P95 latency?” “What does each request cost?”\n>\n> Source: AzureDiagnostics — per-request completion logs from Cognitive Services"
+            },
+            "name": "section-interactions"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL | where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end} | summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource, Project;\nlet totalTokens = toscalar(CostData | summarize sum(ConsumedQuantity));\nlet inputTokens = toscalar(CostData | where Direction == 'Input' | summarize sum(ConsumedQuantity));\nlet outputTokens = toscalar(CostData | where Direction == 'Output' | summarize sum(ConsumedQuantity));\nlet inputRatio = iff(totalTokens > 0, round(inputTokens / totalTokens, 2), 0.0);\nlet totalCost = toscalar(CostData | summarize sum(BilledCost));\nlet reqData = AzureDiagnostics\n| where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES' and Category == 'RequestResponse'\n| where OperationName in ('Completions_Create','create_completions','create_response');\nlet totalReqs = toscalar(reqData | summarize count());\nlet avgLatency = toscalar(reqData | summarize round(avg(todecimal(DurationMs)), 0));\nlet p95Latency = toscalar(reqData | summarize round(percentile(todecimal(DurationMs), 95), 0));\nlet maxLatency = toscalar(reqData | summarize round(max(todecimal(DurationMs)), 0));\nlet avgTokensPerReq = iff(totalReqs > 0, round(totalTokens / (totalReqs * 1.0), 0), 0.0);\nlet costPerReq = iff(totalReqs > 0, round(totalCost / (totalReqs * 1.0), 6), 0.0);\nreqData\n| summarize Total = count(), AvgLat = round(avg(todecimal(DurationMs)), 0), P95Lat = round(percentile(todecimal(DurationMs), 95), 0), MaxLat = round(max(todecimal(DurationMs)), 0)\n| extend AvgTokPerReq = avgTokensPerReq, CostPer = costPerReq, InRatio = inputRatio\n| project\n    ['Total Interactions'] = Total,\n    ['Avg Tokens/Interaction'] = AvgTokPerReq,\n    ['Input/Output Ratio'] = InRatio,\n    ['Avg Cost/Interaction ($)'] = CostPer,\n    ['Avg Latency (ms)'] = AvgLat,\n    ['P95 Latency (ms)'] = P95Lat,\n    ['Max Latency (ms)'] = MaxLat",
+                "size": 4,
+                "title": "Interaction Profile â€” Use These for Forecasting â¬‡",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "table",
+                "gridSettings": {
+                    "formatters": [
+                        {
+                            "columnMatch": "Value",
+                            "formatter": 1
+                        },
+                        {
+                            "columnMatch": "Detail",
+                            "formatter": 0,
+                            "formatOptions": {}
+                        }
+                    ]
+                }
+            },
+            "customWidth": "50",
+            "name": "interaction-profile"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL | where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end} | summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource, Project;\nlet totalReqs = toscalar(AzureDiagnostics | where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES' and Category == 'RequestResponse' | where OperationName in ('Completions_Create','create_completions','create_response') | summarize count());\nlet allTokens = toscalar(CostData | summarize sum(ConsumedQuantity));\nCostData\n| summarize InputTokens = sumif(ConsumedQuantity, Direction == 'Input'), OutputTokens = sumif(ConsumedQuantity, Direction == 'Output'), TotalCost = sum(BilledCost), MinDay = min(ChargePeriodStart), MaxDay = max(ChargePeriodStart) by Model\n| extend TotalTokens = InputTokens + OutputTokens\n| extend DaySpan = max_of(datetime_diff('day', MaxDay, MinDay) + 1, 1)\n| extend TokenShare = iff(allTokens > 0, TotalTokens / allTokens, 0.0)\n| extend EstReqs = round(totalReqs * TokenShare, 0)\n| project Model,\n    ['Est. Interactions'] = tolong(EstReqs),\n    ['Avg Tokens/Req'] = iff(EstReqs > 0, round(TotalTokens / EstReqs, 0), 0.0),\n    ['Avg Prompt'] = iff(EstReqs > 0, round(InputTokens / EstReqs, 0), 0.0),\n    ['Avg Completion'] = iff(EstReqs > 0, round(OutputTokens / EstReqs, 0), 0.0),\n    ['Input Ratio'] = iff(TotalTokens > 0, round(InputTokens / TotalTokens, 2), 0.0),\n    ['Daily Avg Reqs'] = iff(EstReqs > 0, round(EstReqs / (DaySpan * 1.0), 1), 0.0),\n    ['Total Cost ($)'] = round(TotalCost, 4)\n| order by ['Est. Interactions'] desc",
+                "size": 4,
+                "title": "Interaction Profile per Model",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "table",
+                "gridSettings": {
+                    "formatters": [
+                        { "columnMatch": "Interactions", "formatter": 3, "formatOptions": { "palette": "blue" } },
+                        { "columnMatch": "Input Ratio", "formatter": 8, "formatOptions": { "palette": "coldHot" } },
+                        { "columnMatch": "Total Cost", "formatter": 3, "formatOptions": { "palette": "green" } },
+                        { "columnMatch": "Avg", "formatter": 1 }
+                    ]
+                }
+            },
+            "customWidth": "100",
+            "name": "model-interaction-profile"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "AzureDiagnostics\n| where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES' and Category == 'RequestResponse'\n| where OperationName in ('Completions_Create','create_completions','create_response')\n| summarize Requests = count() by bin(TimeGenerated, 1h)\n| render timechart",
+                "size": 0,
+                "title": "Interactions Over Time",
+                "timeContext": {
+                    "durationMs": 604800000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "timechart"
+            },
+            "customWidth": "50",
+            "name": "interactions-over-time"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "AzureDiagnostics\n| where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES' and Category == 'RequestResponse'\n| where OperationName in ('Completions_Create','create_completions','create_response')\n| extend LatencyMs = todecimal(DurationMs)\n| extend LatencyBucket = case(\n    LatencyMs < 500, '<500ms',\n    LatencyMs < 1000, '500ms-1s',\n    LatencyMs < 3000, '1-3s',\n    LatencyMs < 10000, '3-10s',\n    '>10s')\n| summarize Count = count() by LatencyBucket\n| order by LatencyBucket asc\n| render piechart",
+                "size": 1,
+                "title": "Latency Distribution",
+                "timeContext": {
+                    "durationMs": 604800000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "piechart"
+            },
+            "customWidth": "35",
+            "name": "latency-distribution"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "AzureDiagnostics\n| where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES' and Category == 'RequestResponse'\n| summarize\n    Total = count(),\n    Success = countif(ResultSignature == '200'),\n    Throttled = countif(ResultSignature == '429'),\n    Errors = countif(ResultSignature !in ('200','429') and isnotempty(ResultSignature))\n  by OperationName\n| extend SuccessRate = iff(Total > 0, round((Success * 1.0) * 100 / (Total * 1.0), 1), 0.0)\n| project Operation = OperationName, Total, Success, Throttled, Errors, ['Success Rate %'] = SuccessRate\n| order by Total desc",
+                "size": 4,
+                "title": "Request Reliability by Operation",
+                "timeContext": {
+                    "durationMs": 604800000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "table",
+                "gridSettings": {
+                    "formatters": [
+                        {
+                            "columnMatch": "Throttled",
+                            "formatter": 18,
+                            "formatOptions": {}
+                        },
+                        {
+                            "columnMatch": "Errors",
+                            "formatter": 18,
+                            "formatOptions": {}
+                        },
+                        {
+                            "columnMatch": "Success Rate",
+                            "formatter": 18,
+                            "formatOptions": {}
+                        }
+                    ]
+                }
+            },
+            "customWidth": "65",
+            "name": "request-reliability"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "AzureDiagnostics\n| where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES' and Category == 'RequestResponse'\n| where OperationName in ('Completions_Create','create_completions','create_response')\n| extend LatencyMs = todecimal(DurationMs)\n| summarize AvgLatency = round(avg(LatencyMs), 0), P95 = round(percentile(LatencyMs, 95), 0) by bin(TimeGenerated, 1h)\n| render timechart",
+                "size": 0,
+                "title": "Latency Over Time (Avg vs P95)",
+                "timeContext": {
+                    "durationMs": 604800000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "timechart"
+            },
+            "name": "latency-over-time"
+        },
+        {
+            "type": 1,
+            "content": {
+                "json": "### Interactions by Project\n> **Value:** Per-project operational health — surfaces which project has throttling or error problems so you know where to add retries or request quota increases.\n>\n> Source: AzureDiagnostics — project extracted from ResourceId"
+            },
+            "name": "section-interactions-by-project"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "AzureDiagnostics\n| where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES' and Category == 'RequestResponse'\n| where OperationName in ('Completions_Create','create_completions','create_response')\n| extend FoundryResource = extract('/accounts/([^/]+)', 1, _ResourceId)\n| extend Project = iff(_ResourceId has '/projects/', extract('/projects/([^/]+)', 1, _ResourceId), 'shared')\n| extend LatencyMs = todecimal(DurationMs)\n| summarize\n    Requests = count(),\n    AvgLatency = round(avg(LatencyMs), 0),\n    P95Latency = round(percentile(LatencyMs, 95), 0),\n    Throttled = countif(ResultSignature == '429'),\n    Errors = countif(ResultSignature !in ('200','429') and isnotempty(ResultSignature))\n  by FoundryResource, Project\n| extend SuccessRate = iff(Requests > 0, round(((Requests - Throttled - Errors) * 100.0) / (Requests * 1.0), 1), 0.0)\n| project ['Foundry Resource'] = FoundryResource,\n    ['Project'] = Project,\n    ['Requests'] = Requests,\n    ['Avg Latency (ms)'] = AvgLatency,\n    ['P95 Latency (ms)'] = P95Latency,\n    ['Throttled'] = Throttled,\n    ['Errors'] = Errors,\n    ['Success %'] = SuccessRate\n| order by ['Foundry Resource'] asc, Requests desc",
+                "size": 4,
+                "title": "Request Volume & Latency by Foundry Resource â†’ Project",
+                "timeContext": {
+                    "durationMs": 604800000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "table",
+                "gridSettings": {
+                    "formatters": [
+                        {
+                            "columnMatch": "Requests",
+                            "formatter": 3,
+                            "formatOptions": {}
+                        },
+                        {
+                            "columnMatch": "Avg Latency",
+                            "formatter": 1
+                        },
+                        {
+                            "columnMatch": "P95 Latency",
+                            "formatter": 1
+                        },
+                        {
+                            "columnMatch": "Throttled",
+                            "formatter": 18,
+                            "formatOptions": {}
+                        },
+                        {
+                            "columnMatch": "Errors",
+                            "formatter": 18,
+                            "formatOptions": {}
+                        },
+                        {
+                            "columnMatch": "Success",
+                            "formatter": 18,
+                            "formatOptions": {}
+                        }
+                    ]
+                }
+            },
+            "name": "interactions-by-project-table"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "AzureDiagnostics\n| where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES' and Category == 'RequestResponse'\n| where OperationName in ('Completions_Create','create_completions','create_response')\n| extend Project = iff(_ResourceId has '/projects/', extract('/projects/([^/]+)', 1, _ResourceId), 'shared')\n| summarize Requests = count() by bin(TimeGenerated, 1h), Project\n| render timechart",
+                "size": 0,
+                "title": "Interactions Over Time by Project",
+                "timeContext": {
+                    "durationMs": 604800000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "timechart"
+            },
+            "customWidth": "50",
+            "name": "interactions-over-time-by-project"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "AzureDiagnostics\n| where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES' and Category == 'RequestResponse'\n| where OperationName in ('Completions_Create','create_completions','create_response')\n| extend Project = iff(_ResourceId has '/projects/', extract('/projects/([^/]+)', 1, _ResourceId), 'shared')\n| summarize Requests = count() by Project\n| render piechart",
+                "size": 1,
+                "title": "Request Share by Project",
+                "timeContext": {
+                    "durationMs": 604800000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "piechart"
+            },
+            "customWidth": "50",
+            "name": "request-share-by-project-pie"
+        },
+        {
+            "type": 1,
+            "content": {
+                "json": "---\n## 📡 Native Metrics by Project\n> **Value:** Platform-reported token and request counts (independent of billing data). Cross-reference with cost data to validate completeness and detect metering discrepancies.\n>\n> Answers: “Do platform metrics match what we are billed?” “Is token usage trending up in real-time?”\n>\n> Source: AzureMetrics — requires Diagnostic Settings with AllMetrics enabled on Foundry accounts."
+            },
+            "name": "section-native-metrics"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let ProjectMap = AICostData_CL\n| where isnotempty(FoundryResource) and isnotempty(Project) and Project != 'unknown' and Project != 'no-project'\n| summarize Project = take_any(Project) by FoundryResource;\nAzureMetrics\n| where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES'\n| where MetricName in ('TokenTransaction', 'ProcessedPromptTokens', 'GeneratedTokens')\n| extend Resource = extract('/accounts/([^/]+)', 1, _ResourceId)\n| where Resource == \"{SelectedFoundryAccount}\"\n| extend ProjectFromId = iff(_ResourceId has '/projects/', extract('/projects/([^/]+)', 1, _ResourceId), '')\n| join kind=leftouter (ProjectMap) on $left.Resource == $right.FoundryResource\n| extend ResolvedProject = iff(isnotempty(ProjectFromId), ProjectFromId, iff(isnotempty(Project1), Project1, 'account-level'))\n| summarize Tokens = sum(Total) by Resource, ResolvedProject, MetricName\n| extend Metric = case(\n    MetricName == 'TokenTransaction', 'Total Tokens',\n    MetricName == 'ProcessedPromptTokens', 'Input Tokens',\n    MetricName == 'GeneratedTokens', 'Output Tokens',\n    MetricName)\n| project Resource, Project = ResolvedProject, Metric, Tokens\n| order by Resource asc, Project asc, Metric asc",
+                "size": 4,
+                "title": "Token Metrics in {SelectedFoundryAccount}",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "table",
+                "gridSettings": {
+                    "formatters": [
+                        {
+                            "columnMatch": "Tokens",
+                            "formatter": 3,
+                            "formatOptions": {},
+                            "numberFormat": {}
+                        }
+                    ]
+                }
+            },
+            "conditionalVisibility": {
+                "parameterName": "SelectedFoundryAccount",
+                "comparison": "isNotEqualTo"
+            },
+            "customWidth": "50",
+            "name": "native-metrics-tokens-by-project"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let ProjectMap = AICostData_CL\n| where isnotempty(FoundryResource) and isnotempty(Project) and Project != 'unknown' and Project != 'no-project'\n| summarize Project = take_any(Project) by FoundryResource;\nAzureMetrics\n| where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES'\n| where MetricName in ('TokenTransaction', 'ProcessedPromptTokens', 'GeneratedTokens')\n| extend Resource = extract('/accounts/([^/]+)', 1, _ResourceId)\n| where Resource == \"{SelectedFoundryAccount}\"\n| extend ProjectFromId = iff(_ResourceId has '/projects/', extract('/projects/([^/]+)', 1, _ResourceId), '')\n| join kind=leftouter (ProjectMap) on $left.Resource == $right.FoundryResource\n| extend ResolvedProject = iff(isnotempty(ProjectFromId), ProjectFromId, iff(isnotempty(Project1), Project1, 'account-level'))\n| summarize Tokens = sum(Total) by bin(TimeGenerated, 1h), ResolvedProject, MetricName\n| where MetricName == 'TokenTransaction'\n| project TimeGenerated, Project = ResolvedProject, Tokens\n| render timechart",
+                "size": 0,
+                "title": "Total Tokens Over Time in {SelectedFoundryAccount}",
+                "timeContext": {
+                    "durationMs": 604800000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "timechart"
+            },
+            "conditionalVisibility": {
+                "parameterName": "SelectedFoundryAccount",
+                "comparison": "isNotEqualTo"
+            },
+            "customWidth": "50",
+            "name": "native-metrics-tokens-timechart"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let ProjectMap = AICostData_CL\n| where isnotempty(FoundryResource) and isnotempty(Project) and Project != 'unknown' and Project != 'no-project'\n| summarize Project = take_any(Project) by FoundryResource;\nAzureMetrics\n| where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES'\n| where MetricName in ('AzureOpenAIRequests', 'TotalCalls')\n| extend Resource = extract('/accounts/([^/]+)', 1, _ResourceId)\n| where Resource == \"{SelectedFoundryAccount}\"\n| extend ProjectFromId = iff(_ResourceId has '/projects/', extract('/projects/([^/]+)', 1, _ResourceId), '')\n| join kind=leftouter (ProjectMap) on $left.Resource == $right.FoundryResource\n| extend ResolvedProject = iff(isnotempty(ProjectFromId), ProjectFromId, iff(isnotempty(Project1), Project1, 'account-level'))\n| summarize Requests = sum(Total) by Resource, ResolvedProject\n| project Resource, Project = ResolvedProject, Requests\n| order by Resource asc, Requests desc",
+                "size": 4,
+                "title": "Request Count in {SelectedFoundryAccount}",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "table",
+                "gridSettings": {
+                    "formatters": [
+                        {
+                            "columnMatch": "Requests",
+                            "formatter": 3,
+                            "formatOptions": {}
+                        }
+                    ]
+                }
+            },
+            "conditionalVisibility": {
+                "parameterName": "SelectedFoundryAccount",
+                "comparison": "isNotEqualTo"
+            },
+            "customWidth": "50",
+            "name": "native-metrics-requests-by-project"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let ProjectMap = AICostData_CL\n| where isnotempty(FoundryResource) and isnotempty(Project) and Project != 'unknown' and Project != 'no-project'\n| summarize Project = take_any(Project) by FoundryResource;\nAzureMetrics\n| where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES'\n| where MetricName in ('AzureOpenAIRequests', 'TotalCalls')\n| extend Resource = extract('/accounts/([^/]+)', 1, _ResourceId)\n| where Resource == \"{SelectedFoundryAccount}\"\n| extend ProjectFromId = iff(_ResourceId has '/projects/', extract('/projects/([^/]+)', 1, _ResourceId), '')\n| join kind=leftouter (ProjectMap) on $left.Resource == $right.FoundryResource\n| extend ResolvedProject = iff(isnotempty(ProjectFromId), ProjectFromId, iff(isnotempty(Project1), Project1, 'account-level'))\n| summarize Requests = sum(Total) by bin(TimeGenerated, 1h), ResolvedProject\n| project TimeGenerated, Project = ResolvedProject, Requests\n| render timechart",
+                "size": 0,
+                "title": "Requests Over Time in {SelectedFoundryAccount}",
+                "timeContext": {
+                    "durationMs": 604800000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "timechart"
+            },
+            "conditionalVisibility": {
+                "parameterName": "SelectedFoundryAccount",
+                "comparison": "isNotEqualTo"
+            },
+            "customWidth": "50",
+            "name": "native-metrics-requests-timechart"
+        },
+        {
+            "type": 1,
+            "content": {
+                "json": "---\n## 📈 Cost Trends & Growth\n> **Value:** Month-over-month trajectory for budget planning and executive reporting. Reveals whether spending is accelerating, stable, or declining.\n>\n> Answers: “Is spending growing?” “Did last month’s optimization actually reduce cost?”\n>\n> Source: AICostData_CL — monthly aggregation with growth percentage"
+            },
+            "name": "section-cost-trends"
+        },
+        {
+            "type": 9,
+            "content": {
+                "version": "KqlParameterItem/1.0",
+                "parameters": [
+                    {
+                        "id": "v5-granularity",
+                        "version": "KqlParameterItem/1.0",
+                        "name": "Granularity",
+                        "label": "View",
+                        "type": 2,
+                        "typeSettings": { "additionalResourceOptions": [] },
+                        "jsonData": "[{\"value\":\"Monthly\", \"label\":\"Monthly\"}, {\"value\":\"Daily\", \"label\":\"Daily\"}]",
+                        "value": "Monthly"
+                    }
+                ],
+                "style": "pills"
+            },
+            "name": "cost-trends-granularity-param"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL | where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end} | summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource, Project;\nCostData\n| extend PeriodDt = case('{Granularity}' == 'Daily', startofday(ChargePeriodStart), startofmonth(ChargePeriodStart))\n| summarize Cost = round(sum(BilledCost), 4) by PeriodDt, Model\n| extend Period = case('{Granularity}' == 'Daily', format_datetime(PeriodDt, 'yyyy-MM-dd'), strcat(case(monthofyear(PeriodDt)==1,'Jan',monthofyear(PeriodDt)==2,'Feb',monthofyear(PeriodDt)==3,'Mar',monthofyear(PeriodDt)==4,'Apr',monthofyear(PeriodDt)==5,'May',monthofyear(PeriodDt)==6,'Jun',monthofyear(PeriodDt)==7,'Jul',monthofyear(PeriodDt)==8,'Aug',monthofyear(PeriodDt)==9,'Sep',monthofyear(PeriodDt)==10,'Oct',monthofyear(PeriodDt)==11,'Nov','Dec'), ' ', format_datetime(PeriodDt, 'yyyy')))\n| project Period, Cost, Model\n| order by Period asc\n| render barchart",
+                "size": 0,
+                "title": "{Granularity} Cost Trend by Model",
+                "timeContext": {
+                    "durationMs": 7776000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "barchart",
+                "chartSettings": {
+                    "xAxis": "Period",
+                    "yAxis": [
+                        "Cost"
+                    ],
+                    "group": "Model",
+                    "showLegend": true
+                }
+            },
+            "customWidth": "50",
+            "name": "cost-trend-chart"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL | where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end} | summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource, Project;\nCostData\n| extend PeriodDt = case('{Granularity}' == 'Daily', startofday(ChargePeriodStart), startofmonth(ChargePeriodStart))\n| summarize Tokens = round(sum(ConsumedQuantity), 0) by PeriodDt, Model\n| extend Period = case('{Granularity}' == 'Daily', format_datetime(PeriodDt, 'yyyy-MM-dd'), strcat(case(monthofyear(PeriodDt)==1,'Jan',monthofyear(PeriodDt)==2,'Feb',monthofyear(PeriodDt)==3,'Mar',monthofyear(PeriodDt)==4,'Apr',monthofyear(PeriodDt)==5,'May',monthofyear(PeriodDt)==6,'Jun',monthofyear(PeriodDt)==7,'Jul',monthofyear(PeriodDt)==8,'Aug',monthofyear(PeriodDt)==9,'Sep',monthofyear(PeriodDt)==10,'Oct',monthofyear(PeriodDt)==11,'Nov','Dec'), ' ', format_datetime(PeriodDt, 'yyyy')))\n| project Period, Tokens, Model\n| order by Period asc\n| render barchart",
+                "size": 0,
+                "title": "{Granularity} Token Trend by Model",
+                "timeContext": {
+                    "durationMs": 7776000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "barchart",
+                "chartSettings": {
+                    "xAxis": "Period",
+                    "yAxis": [
+                        "Tokens"
+                    ],
+                    "group": "Model",
+                    "showLegend": true
+                }
+            },
+            "customWidth": "50",
+            "name": "token-trend-chart"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL | where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end} | summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource, Project;\nCostData\n| extend PeriodDt = case('{Granularity}' == 'Daily', startofday(ChargePeriodStart), startofmonth(ChargePeriodStart))\n| summarize Cost = round(sum(BilledCost), 4) by PeriodDt, Model\n| extend Period = case('{Granularity}' == 'Daily', format_datetime(PeriodDt, 'yyyy-MM-dd'), strcat(case(monthofyear(PeriodDt)==1,'Jan',monthofyear(PeriodDt)==2,'Feb',monthofyear(PeriodDt)==3,'Mar',monthofyear(PeriodDt)==4,'Apr',monthofyear(PeriodDt)==5,'May',monthofyear(PeriodDt)==6,'Jun',monthofyear(PeriodDt)==7,'Jul',monthofyear(PeriodDt)==8,'Aug',monthofyear(PeriodDt)==9,'Sep',monthofyear(PeriodDt)==10,'Oct',monthofyear(PeriodDt)==11,'Nov','Dec'), ' ', format_datetime(PeriodDt, 'yyyy')))\n| project Period, Model, Cost\n| order by Period asc, Model asc",
+                "size": 4,
+                "title": "{Granularity} Cost by Model",
+                "timeContext": {
+                    "durationMs": 7776000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "table",
+                "gridSettings": {
+                    "formatters": [
+                        {
+                            "columnMatch": "Cost",
+                            "formatter": 3,
+                            "formatOptions": {},
+                            "numberFormat": {}
+                        }
+                    ]
+                }
+            },
+            "customWidth": "50",
+            "name": "cost-by-period-table"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL | where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end} | summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource, Project;\nCostData\n| extend PeriodDt = case('{Granularity}' == 'Daily', startofday(ChargePeriodStart), startofmonth(ChargePeriodStart))\n| summarize Cost = round(sum(BilledCost), 4) by PeriodDt\n| order by PeriodDt asc\n| extend PrevCost = prev(Cost)\n| extend ['Growth %'] = iff(isnotnull(PrevCost) and PrevCost > 0, round((Cost - PrevCost) * 100.0 / PrevCost, 1), real(null))\n| extend Period = case('{Granularity}' == 'Daily', format_datetime(PeriodDt, 'yyyy-MM-dd'), strcat(case(monthofyear(PeriodDt)==1,'Jan',monthofyear(PeriodDt)==2,'Feb',monthofyear(PeriodDt)==3,'Mar',monthofyear(PeriodDt)==4,'Apr',monthofyear(PeriodDt)==5,'May',monthofyear(PeriodDt)==6,'Jun',monthofyear(PeriodDt)==7,'Jul',monthofyear(PeriodDt)==8,'Aug',monthofyear(PeriodDt)==9,'Sep',monthofyear(PeriodDt)==10,'Oct',monthofyear(PeriodDt)==11,'Nov','Dec'), ' ', format_datetime(PeriodDt, 'yyyy')))\n| project Period, ['Cost ($)'] = Cost, ['Growth %']",
+                "size": 4,
+                "title": "{Granularity} Cost Growth",
+                "timeContext": {
+                    "durationMs": 7776000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "table",
+                "gridSettings": {
+                    "formatters": [
+                        {
+                            "columnMatch": "Cost",
+                            "formatter": 1,
+                            "numberFormat": {}
+                        },
+                        {
+                            "columnMatch": "Growth",
+                            "formatter": 8,
+                            "formatOptions": {}
+                        }
+                    ]
+                }
+            },
+            "customWidth": "50",
+            "name": "cost-growth-table"
+        },
+        {
+            "type": 1,
+            "content": {
+                "json": "---\n## Cost Forecast Simulator\n> **Sources: Both** \u2014 baseline tokens from `AICostData_CL`, interaction counts from `AzureDiagnostics`, projected costs use published model pricing rates.\n>\n> Select a model to see its specific token ratio used in projections. Adjust scenario parameters to model user growth."
+            },
+            "name": "section-forecast"
+        },
+        {
+            "type": 9,
+            "content": {
+                "version": "KqlParameterItem/1.0",
+                "parameters": [
+                    {
+                        "id": "v5-fc-model",
+                        "version": "KqlParameterItem/1.0",
+                        "name": "ForecastModel",
+                        "label": "Forecast Model",
+                        "type": 2,
+                        "query": "AICostData_CL\n| where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end}\n| summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction\n| summarize TotalCost = sum(BilledCost) by Model\n| order by TotalCost desc\n| project value=Model, label=Model",
+                        "typeSettings": { "additionalResourceOptions": [] },
+                        "queryType": 0,
+                        "resourceType": "microsoft.operationalinsights/workspaces",
+                        "crossComponentResources": ["{LogAnalyticsWorkspace}"],
+                        "value": "gpt-4.1"
+                    }
+                ],
+                "style": "pills"
+            },
+            "name": "forecast-model-param"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL | where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end} | summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource, Project;\nlet totalReqs = toscalar(AzureDiagnostics | where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES' and Category == 'RequestResponse' | where OperationName in ('Completions_Create','create_completions','create_response') | summarize count());\nlet allTokens = toscalar(CostData | summarize sum(ConsumedQuantity));\nlet modelData = CostData | where Model == '{ForecastModel}';\nlet inputTokens = toscalar(modelData | where Direction == 'Input' | summarize sum(ConsumedQuantity));\nlet outputTokens = toscalar(modelData | where Direction == 'Output' | summarize sum(ConsumedQuantity));\nlet totalTokens = inputTokens + outputTokens;\nlet tokenShare = iff(allTokens > 0, totalTokens / allTokens, 0.0);\nlet estReqs = round(totalReqs * tokenShare, 0);\nlet daySpan = toscalar(modelData | summarize max_of(datetime_diff('day', max(ChargePeriodStart), min(ChargePeriodStart)) + 1, 1));\nprint ['Total Interactions'] = tolong(estReqs), ['Avg Tokens/Interaction'] = iff(estReqs > 0, round(totalTokens / estReqs, 0), 0.0), ['Avg Prompt Tokens'] = iff(estReqs > 0, round(inputTokens / estReqs, 0), 0.0), ['Avg Completion Tokens'] = iff(estReqs > 0, round(outputTokens / estReqs, 0), 0.0), ['Input Ratio'] = iff(totalTokens > 0, round(inputTokens / totalTokens, 2), 0.0), ['Daily Avg Interactions'] = iff(estReqs > 0, round(estReqs / (daySpan * 1.0), 1), 0.0)",
+                "size": 4,
+                "title": "Selected Model Baseline ({ForecastModel})",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "table",
+                "gridSettings": {
+                    "formatters": [
+                        { "columnMatch": "Total Interactions", "formatter": 1 },
+                        { "columnMatch": "Avg Tokens", "formatter": 1 },
+                        { "columnMatch": "Input Ratio", "formatter": 1 }
+                    ]
+                }
+            },
+            "name": "forecast-baseline"
+        },
+        {
+            "type": 9,
+            "content": {
+                "version": "KqlParameterItem/1.0",
+                "parameters": [
+                    {
+                        "id": "v5-fc01",
+                        "version": "KqlParameterItem/1.0",
+                        "name": "LightUsers",
+                        "label": "Light: Users",
+                        "type": 1,
+                        "value": "5000"
+                    },
+                    {
+                        "id": "v5-fc02",
+                        "version": "KqlParameterItem/1.0",
+                        "name": "LightInteractions",
+                        "label": "Light: Interactions/User",
+                        "type": 1,
+                        "value": "3"
+                    },
+                    {
+                        "id": "v5-fc03",
+                        "version": "KqlParameterItem/1.0",
+                        "name": "MediumUsers",
+                        "label": "Medium: Users",
+                        "type": 1,
+                        "value": "10000"
+                    },
+                    {
+                        "id": "v5-fc04",
+                        "version": "KqlParameterItem/1.0",
+                        "name": "MediumInteractions",
+                        "label": "Medium: Interactions/User",
+                        "type": 1,
+                        "value": "5"
+                    },
+                    {
+                        "id": "v5-fc05",
+                        "version": "KqlParameterItem/1.0",
+                        "name": "HeavyUsers",
+                        "label": "Heavy: Users",
+                        "type": 1,
+                        "value": "15000"
+                    },
+                    {
+                        "id": "v5-fc06",
+                        "version": "KqlParameterItem/1.0",
+                        "name": "HeavyInteractions",
+                        "label": "Heavy: Interactions/User",
+                        "type": 1,
+                        "value": "7"
+                    }
+                ],
+                "style": "above"
+            },
+            "name": "forecast-parameters"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL | where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end} | summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource, Project;\nlet modelData = CostData | where Model == '{ForecastModel}';\nlet totalTokens = toscalar(modelData | summarize sum(ConsumedQuantity));\nlet inputTokens = toscalar(modelData | where Direction == 'Input' | summarize sum(ConsumedQuantity));\nlet totalReqs = toscalar(AzureDiagnostics | where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES' and Category == 'RequestResponse' | where OperationName in ('Completions_Create','create_completions','create_response') | summarize count());\nlet allTokens = toscalar(CostData | summarize sum(ConsumedQuantity));\nlet tokenShare = iff(allTokens > 0, totalTokens / allTokens, 0.0);\nlet estReqs = totalReqs * tokenShare;\nlet avgTokens = iff(estReqs > 0, round(totalTokens / estReqs, 0), 500.0);\nlet inputRatio = iff(totalTokens > 0, round(inputTokens / totalTokens, 2), 0.7);\nlet pricing = datatable(Model:string, PromptRate:real, CompletionRate:real) ['gpt-4.1', 2.0, 8.0, 'gpt-4.1-mini', 0.4, 1.6, 'gpt-4.1-nano', 0.1, 0.4, 'gpt-4o', 2.5, 10.0, 'gpt-4o-mini', 0.15, 0.6, 'o3', 10.0, 40.0, 'o3-mini', 1.1, 4.4, 'o4-mini', 1.1, 4.4, 'text-embedding-3-small', 0.02, 0.0, 'text-embedding-3-large', 0.13, 0.0];\nlet selectedModel = '{ForecastModel}';\nlet promptRate = coalesce(toscalar(pricing | where Model == selectedModel | project PromptRate), 2.0);\nlet completionRate = coalesce(toscalar(pricing | where Model == selectedModel | project CompletionRate), 8.0);\nlet scenarios = datatable(Scenario:string, Users:long, InteractionsPerUser:long, SortOrder:int) [\n    'Light', {LightUsers}, {LightInteractions}, 1,\n    'Medium', {MediumUsers}, {MediumInteractions}, 2,\n    'Heavy', {HeavyUsers}, {HeavyInteractions}, 3\n];\nscenarios\n| extend AvgTokensPerInteraction = avgTokens\n| extend TotalTokens = Users * 1.0 * InteractionsPerUser * AvgTokensPerInteraction\n| extend PromptTokens = TotalTokens * inputRatio\n| extend CompletionTokens = TotalTokens * (1.0 - inputRatio)\n| extend MonthlyCost = round((PromptTokens * promptRate / 1000000) + (CompletionTokens * completionRate / 1000000), 2)\n| extend AnnualCost = round(MonthlyCost * 12, 0)\n| project Scenario, Model=selectedModel, Users=tolong(Users), ['Interactions/User']=InteractionsPerUser, ['Avg Tokens/Interaction']=AvgTokensPerInteraction, ['Total Tokens (M)']=round(TotalTokens/1000000, 1), ['Monthly Cost ($)']=MonthlyCost, ['Annual Cost ($)']=AnnualCost, SortOrder\n| order by SortOrder asc\n| project-away SortOrder",
+                "size": 4,
+                "title": "Scenario Cost Projection ({ForecastModel})",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "table",
+                "gridSettings": {
+                    "formatters": [
+                        { "columnMatch": "Total Tokens", "formatter": 3, "formatOptions": { "palette": "blue" } },
+                        { "columnMatch": "Monthly Cost", "formatter": 3, "formatOptions": { "palette": "green" } },
+                        { "columnMatch": "Annual Cost", "formatter": 3, "formatOptions": { "palette": "orange" } }
+                    ]
+                }
+            },
+            "name": "forecast-table"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL | where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end} | summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource, Project;\nlet modelData = CostData | where Model == '{ForecastModel}';\nlet totalTokens = toscalar(modelData | summarize sum(ConsumedQuantity));\nlet inputTokens = toscalar(modelData | where Direction == 'Input' | summarize sum(ConsumedQuantity));\nlet allTokens = toscalar(CostData | summarize sum(ConsumedQuantity));\nlet totalReqs = toscalar(AzureDiagnostics | where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES' and Category == 'RequestResponse' | where OperationName in ('Completions_Create','create_completions','create_response') | summarize count());\nlet tokenShare = iff(allTokens > 0, totalTokens / allTokens, 0.0);\nlet estReqs = totalReqs * tokenShare;\nlet avgTokens = iff(estReqs > 0, round(totalTokens / estReqs, 0), 500.0);\nlet inputRatio = iff(totalTokens > 0, round(inputTokens / totalTokens, 2), 0.7);\nlet pricing = datatable(Model:string, PromptRate:real, CompletionRate:real) ['gpt-4.1', 2.0, 8.0, 'gpt-4.1-mini', 0.4, 1.6, 'gpt-4.1-nano', 0.1, 0.4, 'gpt-4o', 2.5, 10.0, 'gpt-4o-mini', 0.15, 0.6, 'o3', 10.0, 40.0, 'o3-mini', 1.1, 4.4, 'o4-mini', 1.1, 4.4, 'text-embedding-3-small', 0.02, 0.0, 'text-embedding-3-large', 0.13, 0.0];\nlet selectedModel = '{ForecastModel}';\nlet promptRate = coalesce(toscalar(pricing | where Model == selectedModel | project PromptRate), 2.0);\nlet completionRate = coalesce(toscalar(pricing | where Model == selectedModel | project CompletionRate), 8.0);\nlet scenarios = datatable(Scenario:string, Users:long, InteractionsPerUser:long) [\n    'Light', {LightUsers}, {LightInteractions},\n    'Medium', {MediumUsers}, {MediumInteractions},\n    'Heavy', {HeavyUsers}, {HeavyInteractions}\n];\nscenarios\n| extend TotalTokens = Users * 1.0 * InteractionsPerUser * avgTokens\n| extend MonthlyCost = round((TotalTokens * inputRatio * promptRate / 1000000) + (TotalTokens * (1.0 - inputRatio) * completionRate / 1000000), 2)\n| project Scenario, MonthlyCost\n| render barchart",
+                "size": 0,
+                "title": "Monthly Cost by Scenario ({ForecastModel})",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "barchart",
+                "chartSettings": {
+                    "seriesLabelSettings": [
+                        { "seriesName": "MonthlyCost", "label": "Monthly Cost (USD)", "color": "green" }
+                    ]
+                }
+            },
+            "customWidth": "50",
+            "name": "forecast-bar"
+        },
+        {
+            "type": 3,
+            "content": {
+                "version": "KqlItem/1.0",
+                "query": "let CostData = AICostData_CL | where ChargePeriodStart >= {TimeRange:start} and ChargePeriodStart <= {TimeRange:end} | summarize arg_max(TimeGenerated, *) by ChargePeriodStart, Model, Direction, FoundryResource, Project;\nlet modelData = CostData | where Model == '{ForecastModel}';\nlet totalTokens = toscalar(modelData | summarize sum(ConsumedQuantity));\nlet allTokens = toscalar(CostData | summarize sum(ConsumedQuantity));\nlet totalReqs = toscalar(AzureDiagnostics | where ResourceProvider == 'MICROSOFT.COGNITIVESERVICES' and Category == 'RequestResponse' | where OperationName in ('Completions_Create','create_completions','create_response') | summarize count());\nlet tokenShare = iff(allTokens > 0, totalTokens / allTokens, 0.0);\nlet estReqs = totalReqs * tokenShare;\nlet avgTokens = iff(estReqs > 0, round(totalTokens / estReqs, 0), 500.0);\nlet scenarios = datatable(Scenario:string, Users:long, InteractionsPerUser:long) [\n    'Light', {LightUsers}, {LightInteractions},\n    'Medium', {MediumUsers}, {MediumInteractions},\n    'Heavy', {HeavyUsers}, {HeavyInteractions}\n];\nscenarios\n| extend TotalTokens = Users * 1.0 * InteractionsPerUser * avgTokens\n| extend TotalTokensM = round(TotalTokens / 1000000, 1)\n| project Scenario, TotalTokensM\n| render barchart",
+                "size": 0,
+                "title": "Monthly Token Volume by Scenario (Millions)",
+                "timeContext": {
+                    "durationMs": 2592000000
+                },
+                "timeContextFromParameter": "TimeRange",
+                "queryType": 0,
+                "resourceType": "microsoft.operationalinsights/workspaces",
+                "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                ],
+                "visualization": "barchart",
+                "chartSettings": {
+                    "seriesLabelSettings": [
+                        { "seriesName": "TotalTokensM", "label": "Total Tokens (M)", "color": "blue" }
+                    ]
+                }
+            },
+            "customWidth": "50",
+            "name": "forecast-tokens-bar"
+        },
+        {
+            "type": 1,
+            "content": {
+                "json": "---\n### ðŸ“Œ Data Source Reference\n| Section | Source Table | What It Shows |\n|---|---|---|\n| Overview KPIs | `AICostData_CL` + `AzureDiagnostics` | Total cost, tokens, requests, avg tokens/interaction |\n| Cost per Model | `AICostData_CL` | Actual billed USD from Azure Cost Management |\n| Foundry Resource â†’ Project | `AICostData_CL` | Cost & tokens by Foundry resource, drill-down by project |\n| Token Usage per Model | `AICostData_CL` + pricing lookup | Tokens derived from billing (Cost Ã· unit price) |\n| Interaction Analytics | `AzureDiagnostics` | Request counts, latency, success rates, throttling |\n| Cost Trends | `AICostData_CL` | MoM growth, daily trends |\n| Forecast | Parameter-driven KQL | Scenario modelling with published pricing |\n\n**No App Insights or APIM required.** Only needs:\n1. Diagnostic settings on Cognitive Services â†’ Log Analytics (RequestResponse logs)\n2. Cost ingestion script (`ingest-cost-data.ps1`) populating `AICostData_CL`\n\n### PayGo Pricing Reference (per 1M tokens)\n| Model | Input | Output | Cached Input |\n|---|---|---|---|\n| GPT-4.1 | $2.00 | $8.00 | $0.50 |\n| GPT-4o (2024-08-06) | $2.50 | $10.00 | $1.25 |\n| GPT-4o-mini | $0.15 | $0.60 | $0.075 |\n| text-embedding-3-small | $0.02 | â€” | â€” |\n\n**Prices from [Azure OpenAI Pricing](https://azure.microsoft.com/pricing/details/cognitive-services/openai-service/) as of May 2026. Microsoft may change pricing at any time.**"
+            },
+            "name": "footer"
+        }
+    ]
+}
